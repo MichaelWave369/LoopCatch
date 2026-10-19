@@ -5,6 +5,9 @@
 #include <windows.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
+#include "process_capture.h"
+#include <cerrno>
+#include <cstdlib>
 #include <functiondiscoverykeys_devpkey.h>
 #include <commdlg.h>
 #include <commctrl.h>
@@ -28,11 +31,14 @@ using Microsoft::WRL::ComPtr;
 namespace {
 constexpr int ID_DEVICE = 101, ID_REFRESH = 102, ID_RECORD = 103;
 constexpr int ID_STOP = 104, ID_STATUS = 105, ID_PATH = 106, ID_LEVEL = 107;
+constexpr int ID_MODE = 108, ID_APP = 109, ID_APP_REFRESH = 110, ID_PID = 111;
 constexpr UINT WM_CAPTURE_DONE = WM_APP + 1;
 
 struct Device { std::wstring id, name; };
 std::vector<Device> g_devices;
+std::vector<CaptureApp> g_apps;
 HWND g_window{}, g_device{}, g_refresh{}, g_record{}, g_stop{}, g_status{}, g_path{}, g_level{};
+HWND g_mode{}, g_app{}, g_appRefresh{}, g_pid{};
 std::atomic<bool> g_stopRequested{false};
 std::atomic<uint64_t> g_audioBytes{0};
 std::atomic<ULONGLONG> g_startedAt{0};
@@ -244,29 +250,39 @@ void ReadPeak(const BYTE* bytes, UINT32 frames, const WAVEFORMATEX* fmt) {
     }
     g_peak.store(static_cast<int>((std::min)(peak, 1.f) * 1000));
 }
-bool Capture(const std::wstring& deviceId, const std::wstring& path,
-             std::wstring& result) {
-    ComPtr<IMMDeviceEnumerator> enumerator;
-    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
-                                  CLSCTX_ALL, IID_PPV_ARGS(&enumerator));
-    if (FAILED(hr)) {
-        result = L"Cannot access audio endpoints: " + ErrorCode(hr);
-        return false;
-    }
-    ComPtr<IMMDevice> device;
-    hr = deviceId.empty()
-        ? enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &device)
-        : enumerator->GetDevice(deviceId.c_str(), &device);
-    if (FAILED(hr)) {
-        result = L"Playback endpoint unavailable: " + ErrorCode(hr);
-        return false;
-    }
+bool Capture(const std::wstring& deviceId, DWORD targetPid,
+             const std::wstring& path, std::wstring& result) {
     ComPtr<IAudioClient> client;
-    hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
-                          reinterpret_cast<void**>(client.GetAddressOf()));
-    if (FAILED(hr)) {
-        result = L"Cannot activate Windows audio client: " + ErrorCode(hr);
-        return false;
+    HRESULT hr = S_OK;
+    if (targetPid) {
+        hr = ActivateProcessLoopback(targetPid, client);
+        if (FAILED(hr)) {
+            result = L"Cannot activate process-loopback capture for PID " +
+                     std::to_wstring(targetPid) + L": " + ErrorCode(hr);
+            return false;
+        }
+    } else {
+        ComPtr<IMMDeviceEnumerator> enumerator;
+        hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
+                              CLSCTX_ALL, IID_PPV_ARGS(&enumerator));
+        if (FAILED(hr)) {
+            result = L"Cannot access audio endpoints: " + ErrorCode(hr);
+            return false;
+        }
+        ComPtr<IMMDevice> device;
+        hr = deviceId.empty()
+            ? enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &device)
+            : enumerator->GetDevice(deviceId.c_str(), &device);
+        if (FAILED(hr)) {
+            result = L"Playback endpoint unavailable: " + ErrorCode(hr);
+            return false;
+        }
+        hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+                              reinterpret_cast<void**>(client.GetAddressOf()));
+        if (FAILED(hr)) {
+            result = L"Cannot activate Windows audio client: " + ErrorCode(hr);
+            return false;
+        }
     }
     WAVEFORMATEX* raw = nullptr;
     hr = client->GetMixFormat(&raw);
@@ -276,7 +292,7 @@ bool Capture(const std::wstring& deviceId, const std::wstring& path,
     }
     std::unique_ptr<WAVEFORMATEX, decltype(&CoTaskMemFree)> format(raw, &CoTaskMemFree);
     hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
-                            10000000, 0, format.get(), nullptr);
+                            targetPid ? 0 : 10000000, 0, format.get(), nullptr);
     if (FAILED(hr)) {
         result = L"WASAPI loopback unavailable: " + ErrorCode(hr) +
                  L". Ensure the audio reaches a shared-mode Windows output.";
@@ -352,21 +368,36 @@ bool Capture(const std::wstring& deviceId, const std::wstring& path,
     result = L"WAV saved successfully.";
     return true;
 }
-void CaptureThread(std::wstring deviceId, std::wstring path) {
+void CaptureThread(std::wstring deviceId, DWORD targetPid, std::wstring path) {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     bool ok = false;
     if (SUCCEEDED(hr)) {
-        ok = Capture(deviceId, path, g_result);
+        ok = Capture(deviceId, targetPid, path, g_result);
         CoUninitialize();
     } else {
         g_result = L"Windows COM initialization failed: " + ErrorCode(hr);
     }
     PostMessageW(g_window, WM_CAPTURE_DONE, ok ? 1 : 0, 0);
 }
+void RefreshApps() {
+    g_apps = ListCaptureApps();
+    SendMessageW(g_app, CB_RESETCONTENT, 0, 0);
+    for (const auto& app : g_apps) {
+        SendMessageW(g_app, CB_ADDSTRING, 0,
+                     reinterpret_cast<LPARAM>(app.label.c_str()));
+    }
+    if (!g_apps.empty()) SendMessageW(g_app, CB_SETCURSEL, 0, 0);
+}
 void SetRecordingUI(bool recording) {
     g_recording = recording;
-    EnableWindow(g_device, !recording);
-    EnableWindow(g_refresh, !recording);
+    const bool appMode = SendMessageW(g_mode, CB_GETCURSEL, 0, 0) == 1;
+    const bool appSupported = SupportsProcessLoopback();
+    EnableWindow(g_mode, !recording);
+    EnableWindow(g_device, !recording && !appMode);
+    EnableWindow(g_refresh, !recording && !appMode);
+    EnableWindow(g_app, !recording && appMode && appSupported);
+    EnableWindow(g_appRefresh, !recording && appMode && appSupported);
+    EnableWindow(g_pid, !recording && appMode && appSupported);
     EnableWindow(g_record, !recording);
     EnableWindow(g_stop, recording);
 }
@@ -380,9 +411,41 @@ std::wstring SuggestedName() {
 }
 void StartRecording() {
     if (g_recording) return;
-    const LRESULT choice = SendMessageW(g_device, CB_GETCURSEL, 0, 0);
-    if (choice == CB_ERR || static_cast<size_t>(choice) >= g_devices.size()) return;
-    const std::wstring deviceId = g_devices[static_cast<size_t>(choice)].id;
+    const bool appMode = SendMessageW(g_mode, CB_GETCURSEL, 0, 0) == 1;
+    DWORD targetPid = 0;
+    std::wstring deviceId;
+    if (appMode) {
+        if (!SupportsProcessLoopback()) {
+            SetWindowTextW(g_status, L"App-only capture needs Windows build 20348+.");
+            return;
+        }
+        wchar_t entered[32]{};
+        GetWindowTextW(g_pid, entered, 32);
+        if (entered[0]) {
+            wchar_t* end = nullptr;
+            errno = 0;
+            const unsigned long parsed = wcstoul(entered, &end, 10);
+            if (errno == ERANGE || !parsed || !end || *end != 0) {
+                SetWindowTextW(g_status, L"Enter a valid numeric process ID.");
+                return;
+            }
+            targetPid = static_cast<DWORD>(parsed);
+        } else {
+            const LRESULT choice = SendMessageW(g_app, CB_GETCURSEL, 0, 0);
+            if (choice == CB_ERR || static_cast<size_t>(choice) >= g_apps.size()) {
+                SetWindowTextW(g_status, L"Select an application, or enter a process ID.");
+                return;
+            }
+            targetPid = g_apps[static_cast<size_t>(choice)].pid;
+        }
+    } else {
+        const LRESULT choice = SendMessageW(g_device, CB_GETCURSEL, 0, 0);
+        if (choice == CB_ERR || static_cast<size_t>(choice) >= g_devices.size()) {
+            SetWindowTextW(g_status, L"Select a playback output.");
+            return;
+        }
+        deviceId = g_devices[static_cast<size_t>(choice)].id;
+    }
     wchar_t path[MAX_PATH]{};
     wcscpy_s(path, SuggestedName().c_str());
     OPENFILENAMEW dialog{};
@@ -403,7 +466,7 @@ void StartRecording() {
     SetWindowTextW(g_status, L"Starting capture...");
     SetRecordingUI(true);
     try {
-        g_worker = std::thread(CaptureThread, deviceId, std::wstring(path));
+        g_worker = std::thread(CaptureThread, deviceId, targetPid, std::wstring(path));
     } catch (...) {
         SetRecordingUI(false);
         SetWindowTextW(g_status, L"Cannot create audio capture thread.");
@@ -420,28 +483,46 @@ HWND Control(const wchar_t* kind, const wchar_t* text, DWORD style,
     return result;
 }
 void SetupUI() {
-    Control(L"STATIC", L"Record audio being played through a Windows output device:",
-            0, 20, 18, 680, 25, 0);
+    Control(L"STATIC", L"Capture mode:", 0, 20, 14, 680, 23, 0);
+    g_mode = Control(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL,
+                     20, 37, 700, 200, ID_MODE);
+    SendMessageW(g_mode, CB_ADDSTRING, 0,
+                 reinterpret_cast<LPARAM>(L"Entire playback device (all application audio)"));
+    SendMessageW(g_mode, CB_ADDSTRING, 0,
+                 reinterpret_cast<LPARAM>(L"One application / process tree (Windows build 20348+)"));
+    SendMessageW(g_mode, CB_SETCURSEL, 0, 0);
+    Control(L"STATIC", L"Playback device (whole-device mode):",
+            0, 20, 74, 680, 21, 0);
     g_device = Control(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL,
-                       20, 46, 515, 250, ID_DEVICE);
+                       20, 97, 525, 250, ID_DEVICE);
     g_refresh = Control(L"BUTTON", L"Refresh devices", BS_PUSHBUTTON,
-                        545, 46, 154, 30, ID_REFRESH);
+                        555, 97, 165, 29, ID_REFRESH);
+    Control(L"STATIC", L"Application (process tree) or optional manual PID:",
+            0, 20, 144, 680, 21, 0);
+    g_app = Control(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL,
+                    20, 167, 465, 350, ID_APP);
+    g_appRefresh = Control(L"BUTTON", L"Refresh apps", BS_PUSHBUTTON,
+                           495, 167, 125, 29, ID_APP_REFRESH);
+    g_pid = Control(L"EDIT", L"", ES_NUMBER | WS_BORDER | ES_AUTOHSCROLL,
+                    630, 169, 90, 25, ID_PID);
+    SendMessageW(g_pid, EM_SETLIMITTEXT, 10, 0);
     g_record = Control(L"BUTTON", L"Record WAV", BS_PUSHBUTTON,
-                       20, 102, 166, 40, ID_RECORD);
+                       20, 214, 166, 42, ID_RECORD);
     g_stop = Control(L"BUTTON", L"Stop & Save", BS_PUSHBUTTON,
-                     197, 102, 166, 40, ID_STOP);
-    Control(L"STATIC", L"Live level:", 0, 20, 161, 80, 24, 0);
+                     197, 214, 166, 42, ID_STOP);
+    Control(L"STATIC", L"Live level:", 0, 20, 274, 90, 22, 0);
     g_level = Control(PROGRESS_CLASSW, L"", PBS_SMOOTH,
-                      105, 160, 594, 22, ID_LEVEL);
+                      105, 272, 615, 23, ID_LEVEL);
     SendMessageW(g_level, PBM_SETRANGE32, 0, 1000);
-    g_status = Control(L"STATIC", L"Ready.", 0, 20, 196, 679, 24, ID_STATUS);
-    Control(L"STATIC", L"Output file:", 0, 20, 226, 679, 22, 0);
+    g_status = Control(L"STATIC", L"Ready.", 0, 20, 313, 700, 23, ID_STATUS);
+    Control(L"STATIC", L"Output file:", 0, 20, 341, 680, 22, 0);
     g_path = Control(L"STATIC", L"Choose a WAV filename when you press Record.",
-                     SS_PATHELLIPSIS, 20, 246, 679, 25, ID_PATH);
-    Control(L"STATIC", L"Captures shared-mode Windows audio. ASIO, exclusive audio, and DRM may bypass it.",
-            0, 20, 283, 690, 25, 0);
+                     SS_PATHELLIPSIS, 20, 363, 700, 23, ID_PATH);
+    Control(L"STATIC", L"ASIO, exclusive audio, DRM, and separate application host processes may bypass capture.",
+            0, 20, 405, 715, 22, 0);
     std::wstring error;
     if (!RefreshDevices(error)) SetWindowTextW(g_status, error.c_str());
+    RefreshApps();
     SetRecordingUI(false);
     SetTimer(g_window, 1, 100, nullptr);
 }
@@ -452,6 +533,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         SetupUI();
         return 0;
     case WM_COMMAND:
+        if (LOWORD(wp) == ID_MODE && HIWORD(wp) == CBN_SELCHANGE) {
+            SetRecordingUI(false);
+            return 0;
+        }
         if (HIWORD(wp) == BN_CLICKED) {
             switch (LOWORD(wp)) {
             case ID_RECORD:
@@ -463,6 +548,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
                     EnableWindow(g_stop, FALSE);
                     SetWindowTextW(g_status, L"Stopping and finalizing WAV...");
                 }
+                return 0;
+            case ID_APP_REFRESH:
+                RefreshApps();
+                SetWindowTextW(g_status, L"Visible application windows refreshed.");
                 return 0;
             case ID_REFRESH: {
                 std::wstring error;
@@ -526,9 +615,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         return 1;
     }
     HWND window = CreateWindowExW(0, klass.lpszClassName,
-        L"LoopCatch v0.1 | Windows Desktop Audio Recorder",
+        L"LoopCatch v0.2 | Windows Audio Recorder",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 735, 370,
+        CW_USEDEFAULT, CW_USEDEFAULT, 758, 477,
         nullptr, nullptr, instance, nullptr);
     if (!window) {
         CoUninitialize();
