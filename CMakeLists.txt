@@ -1,0 +1,15 @@
+cmake_minimum_required(VERSION 3.21)
+project(LoopCatch VERSION 0.1.0 LANGUAGES CXX)
+
+if(NOT WIN32)
+  message(FATAL_ERROR "LoopCatch requires Windows Core Audio APIs.")
+endif()
+
+add_executable(LoopCatch WIN32 src/main.cpp)
+target_compile_features(LoopCatch PRIVATE cxx_std_17)
+target_compile_definitions(LoopCatch PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(LoopCatch PRIVATE ole32 uuid comctl32 comdlg32)
+if(MSVC)
+  target_compile_options(LoopCatch PRIVATE /W4 /EHsc /utf-8)
+endif()
+set_target_properties(LoopCatch PROPERTIES OUTPUT_NAME LoopCatch)
